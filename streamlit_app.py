@@ -187,6 +187,85 @@ SELECT strftime(date, '%Y-%m') AS sales_month, type, SUM(credit) AS monthly_reve
 FROM {T}
 GROUP BY sales_month, type
 ORDER BY sales_month, type;""",
+
+    # NEW: Training → Licenses/Subscriptions
+    "training_to_licenses": f"""
+WITH FirstTraining AS (
+  SELECT account, MIN(date) AS first_training_date
+  FROM {T}
+  WHERE type = 'FME Training'
+  GROUP BY account
+), InitialTrainingSpend AS (
+  SELECT account, SUM(credit) AS total_training_spend
+  FROM {T}
+  WHERE type = 'FME Training'
+  GROUP BY account
+), FollowUpLicenseSubSpend AS (
+  SELECT ft.account, SUM(ad.credit) AS total_license_subscription_spend
+  FROM {T} AS ad
+  JOIN FirstTraining AS ft ON ad.account = ft.account
+  WHERE ad.type IN ('FME Licenses','FME Subscription') AND ad.date > ft.first_training_date
+  GROUP BY ft.account
+)
+SELECT i.account, i.total_training_spend, f.total_license_subscription_spend
+FROM InitialTrainingSpend AS i
+JOIN FollowUpLicenseSubSpend AS f ON i.account = f.account
+ORDER BY i.account;""",
+
+    # NEW: Training → FME Consulting
+    "training_to_cons": f"""
+WITH FirstTraining AS (
+  SELECT account, MIN(date) AS first_training_date
+  FROM {T}
+  WHERE type = 'FME Training'
+  GROUP BY account
+), InitialTrainingSpend AS (
+  SELECT account, SUM(credit) AS total_training_spend
+  FROM {T}
+  WHERE type = 'FME Training'
+  GROUP BY account
+), FollowUpConsultingSpend AS (
+  SELECT ft.account, SUM(ad.credit) AS total_fme_consulting_spend
+  FROM {T} AS ad
+  JOIN FirstTraining AS ft ON ad.account = ft.account
+  WHERE ad.type = 'FME Consulting' AND ad.date > ft.first_training_date
+  GROUP BY ft.account
+)
+SELECT i.account, i.total_training_spend, f.total_fme_consulting_spend
+FROM InitialTrainingSpend AS i
+JOIN FollowUpConsultingSpend AS f ON i.account = f.account
+ORDER BY i.account;""",
+
+    # NEW: New vs Existing customers (monthly)
+    "new_vs_existing": f"""
+WITH FirstMonth AS (
+  SELECT account, date_trunc('month', MIN(date)) AS first_month
+  FROM {T}
+  GROUP BY account
+)
+SELECT strftime(t.date, '%Y-%m') AS sales_month,
+       CASE WHEN date_trunc('month', t.date) = fm.first_month THEN 'New' ELSE 'Existing' END AS customer_status,
+       SUM(t.credit) AS revenue
+FROM {T} t
+JOIN FirstMonth fm ON t.account = fm.account
+GROUP BY sales_month, customer_status
+ORDER BY sales_month, customer_status;""",
+
+    # NEW: YoY/Yo2Y by type (monthly)
+    "yoy": f"""
+WITH M AS (
+  SELECT date_trunc('month', date) AS m, type, SUM(credit) AS revenue
+  FROM {T}
+  GROUP BY 1,2
+), S AS (
+  SELECT m, type, revenue,
+         LAG(revenue, 12) OVER (PARTITION BY type ORDER BY m) AS rev_yoy,
+         LAG(revenue, 24) OVER (PARTITION BY type ORDER BY m) AS rev_yo2y
+  FROM M
+)
+SELECT strftime(m, '%Y-%m') AS sales_month, type, revenue, rev_yoy, rev_yo2y
+FROM S
+ORDER BY sales_month, type;""",
 }
 
 # Layout: two columns per row
@@ -330,6 +409,77 @@ with c8:
         fig.update_layout(xaxis_tickangle=-60)
         st.plotly_chart(fig, use_container_width=True)
     st.dataframe(df, use_container_width=True, hide_index=True)
+
+# 9) Training → Licenses/Subscriptions
+c9, c10 = st.columns(2)
+with c9:
+    st.subheader("FME Training → Licenses/Subscriptions")
+    df = run_sql(db_path, SQL["training_to_licenses"])    
+    if not df.empty:
+        df_top = df.sort_values("total_license_subscription_spend", ascending=False).head(int(top_n_accounts))
+        fig = go.Figure()
+        fig.add_bar(name="Training Spend", x=df_top["account"].astype(str), y=df_top["total_training_spend"]) 
+        fig.add_bar(name="Lic/Sub Follow-up Spend", x=df_top["account"].astype(str), y=df_top["total_license_subscription_spend"]) 
+        fig.update_layout(barmode="group", xaxis_tickangle=-60, height=420)
+        st.plotly_chart(fig, use_container_width=True)
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+# 10) Training → FME Consulting
+with c10:
+    st.subheader("FME Training → FME Consulting")
+    df = run_sql(db_path, SQL["training_to_cons"])    
+    if not df.empty:
+        df_top = df.sort_values("total_fme_consulting_spend", ascending=False).head(int(top_n_accounts))
+        fig = go.Figure()
+        fig.add_bar(name="Training Spend", x=df_top["account"].astype(str), y=df_top["total_training_spend"]) 
+        fig.add_bar(name="Consulting Follow-up Spend", x=df_top["account"].astype(str), y=df_top["total_fme_consulting_spend"]) 
+        fig.update_layout(barmode="group", xaxis_tickangle=-60, height=420)
+        st.plotly_chart(fig, use_container_width=True)
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+# 11) New vs Existing customers (Monthly)
+cn1, cn2 = st.columns(2)
+with cn1:
+    st.subheader("New vs Existing Customers (Monthly)")
+    df = run_sql(db_path, SQL["new_vs_existing"])    
+    if not df.empty:
+        fig = px.bar(df, x="sales_month", y="revenue", color="customer_status", barmode="stack", height=420)
+        fig.update_layout(xaxis_tickangle=-60, legend_title_text="Customer Status")
+        st.plotly_chart(fig, use_container_width=True)
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+# 12) YoY / Yo2Y comparison by Type (latest month)
+with cn2:
+    st.subheader("YoY / Yo2Y by Type (Latest Month)")
+    df = run_sql(db_path, SQL["yoy"])    
+    if not df.empty:
+        latest = df["sales_month"].max()
+        cur = df[df["sales_month"] == latest].copy()
+        # Compute deltas and percentages safely
+        import numpy as _np
+        cur["rev_yoy"] = cur["rev_yoy"].fillna(0)
+        cur["rev_yo2y"] = cur["rev_yo2y"].fillna(0)
+        cur["delta_yoy"] = cur["revenue"] - cur["rev_yoy"]
+        cur["pct_yoy"] = _np.where(cur["rev_yoy"]>0, (cur["delta_yoy"] / cur["rev_yoy"]) * 100.0, _np.nan)
+        cur["delta_yo2y"] = cur["revenue"] - cur["rev_yo2y"]
+        cur["pct_yo2y"] = _np.where(cur["rev_yo2y"]>0, (cur["delta_yo2y"] / cur["rev_yo2y"]) * 100.0, _np.nan)
+        fig = px.bar(
+            cur,
+            x="type",
+            y="revenue",
+            height=420,
+            custom_data=["rev_yoy","delta_yoy","pct_yoy","rev_yo2y","delta_yo2y","pct_yo2y"],
+        )
+        fig.update_traces(
+            hovertemplate=(
+                "Type=%{x}<br>Revenue=%{y:,.0f}"
+                "<br>YoY=%{customdata[0]:,.0f} (Δ=%{customdata[1]:,.0f}, %{customdata[2]:.1f}%)"
+                "<br>Yo2Y=%{customdata[3]:,.0f} (Δ=%{customdata[4]:,.0f}, %{customdata[5]:.1f}%)<extra></extra>"
+            )
+        )
+        fig.update_layout(yaxis_title="Revenue", xaxis_title="Type")
+        st.plotly_chart(fig, use_container_width=True)
+    st.dataframe(cur if 'cur' in locals() else df, use_container_width=True, hide_index=True)
 
 # Cleanup temp file on app exit
 if _db_temp_path and os.path.exists(_db_temp_path):
